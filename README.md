@@ -1,4 +1,4 @@
 qmark-py
 ========
 
-Simple cpu benchmark
+Simple cpu benchmark.
