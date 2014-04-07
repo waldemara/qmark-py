@@ -17,116 +17,106 @@ import time
 
 __all__ = ["qmark"]
 
-QTASKS = 61
-CTASKS = 379
+CLIENTS = 419
+SERVERS = 79
 RUNS = 7
 
 class QMark:
+    ''' Simple CPU benchmark test
+    
+    Greenlet servers read messages from their queues, update trace information, 
+    and send them back to the originators.
 
-    def __init__(self, num_qtasks, num_ctasks, debug = False):
-        self.num_qtasks = num_qtasks
-        self.num_ctasks = num_ctasks
+    Greenlet clients create a single message and pass it sequentially through
+    all servers.  Clients exit when the message passes through all servers.  The
+    test ends when all clients complete.
+
+     Message format
+
+        CMD:TRACE
+
+        CMD		- command
+                    exit	- exit
+                    queue	- update trace and continue test
+
+        TRACE	- list of visited clients and servers, the last item is the
+                  originator of the message
+
+     For example:
+
+        server 1:	queue:client(1)
+        client 1:	queue:client(1)-server(1)
+        server 2:	queue:client(1)-server(1)-client(1)
+        client 1:	queue:client(1)-server(1)-client(1)-server(2)
+        ...
+
+    '''
+
+    def __init__(self, num_clients, num_servers, debug = False):
+        self.num_clients = num_clients
+        self.num_servers = num_servers
         self.debug = debug
+
+    def client(self, cid):
+        ''' Greenlet client
+        '''
+        count = self.num_servers
+        dstid = divmod(cid, self.num_servers)[1]
+        msgout = 'queue:client({0})'.format(cid)
+        self.server_queues[dstid].put(msgout)
+        for msg in self.client_queues[cid]:
+            cmd, trace = msg.split(':')
+            if self.debug:
+                print('client({0}):  {1}'.format(cid, msg))
+            count -= 1
+            if count < 1:
+                break
+            dstid = divmod(dstid + 1, self.num_servers)[1]
+            msgout = msg + '-client({0})'.format(cid)
+            self.server_queues[dstid].put(msgout)
+            gevent.sleep(0)
+        if self.debug:
+            print('client({0}):  exit'.format(cid))
 
     def run(self):
         '''Run the benchmark
         '''
         start_time = time.time()
-        self.qtask_queues = [Queue() for _ in range(self.num_qtasks)]
-        self.ctask_queues = [Queue() for _ in range(self.num_ctasks)]
-        qglets = [gevent.spawn(self.qtask, ix) for ix in range(self.num_qtasks)]
-        cglets = [gevent.spawn(self.ctask, ix) for ix in range(self.num_ctasks)]
+        self.client_queues = [Queue() for _ in range(self.num_clients)]
+        self.server_queues = [Queue() for _ in range(self.num_servers)]
+        qglets = [gevent.spawn(self.server, ix) for ix in range(self.num_servers)]
+        cglets = [gevent.spawn(self.client, ix) for ix in range(self.num_clients)]
         gevent.joinall(cglets)
-        for qq in self.qtask_queues:
-            qq.put('exit::')
+        for qq in self.server_queues:
+            qq.put('exit:admin')
         gevent.joinall(qglets)
         result = time.time() - start_time
         return result
 
-    def build_id(self, name, idx):
-        ''' Construct an id out of name and index
+    def server(self, sid):
+        ''' Greenlet server
         '''
-        return name + '(' + str(idx) + ')'
-
-    def parse_id(self, tid):
-        ''' Parse task or queue id into name and index
-        '''
-        name = tid[:tid.index('(')]
-        idx = str(tid[len(name) + 1: -1])
-        return name, int(idx)
-
-    def qtask(self, qtid):
-        ''' Qmark micro server
-
-            message format:
-
-                CMD:QIDX:PARAMS
-
-                CMD     - command:
-                            exit:   - exit
-                            queue   - put on queue QIDX and add its index to params
-
-                QIDX    - index of the queue to put on: cq(ix) or qq(ix)
-
-                PARAMS  - parameters: ctask(ix) qtask(ix)
-        '''
-
-        for msg in self.qtask_queues[qtid]:
-            cmd, qidx, params = msg.split(':')
+        for msg in self.server_queues[sid]:
             if self.debug:
-                print('qtask({0}): {1}'.format(qtid, msg))
+                print('server({0}):  {1}'.format(sid, msg))
+            cmd, trace = msg.split(':')
             if cmd == 'exit':
                 break
-            name, idx = self.parse_id(qidx)
-            new_params = params.split('-') + [self.build_id('qtask', qtid)]
-            if name == 'cq':
-                new_msg = ':'.join(['queue', self.build_id('ct', idx),'-'.join(new_params)])
-                self.ctask_queues[idx].put(new_msg)
+            dstid = int(msg[msg.rindex('(')+1: msg.rindex(')')])
+            msgout = msg + '-server({0})'.format(sid)
+            self.client_queues[dstid].put(msgout)
             gevent.sleep(0)
 
 
-    def ctask(self, ctid):
-        ''' Qmark micro client
-        '''
-        count = self.num_qtasks
-        dst_ix = divmod(ctid, self.num_qtasks)[1]
-        new_msg = ':'.join(['queue', self.build_id('cq', ctid), self.build_id('ctask', ctid)])
-        self.qtask_queues[dst_ix].put(new_msg)
-        for msg in self.ctask_queues[ctid]:
-            cmd, qidx, params = msg.split(':')
-            if self.debug:
-                print('ctask({0}): {1}'.format(ctid, msg))
-            dst_ix = divmod(dst_ix + 1, self.num_qtasks)[1]
-            new_params = params.split('-') + [self.build_id('ctask', ctid)]
-            new_msg = ':'.join(['queue', self.build_id('cq', ctid), '-'.join(new_params)])
-            self.qtask_queues[dst_ix].put(new_msg)
-            count -= 1
-            if count < 1:
-                break
-            gevent.sleep(0)
-        if self.debug:
-            print('ctask({0}): exit'.format(ctid))
-
-def run_qmark(num_qtasks, num_ctasks, num_runs = 1):
-    ''' Simple CPU benchmark test
-
-    Qtasks are greenlet micro servers. They read messages from their queues
-    then post them onto queues referred to in the messages.
-
-    Ctasks are greenlet micro clients. They create a single message, then pass
-    it through all existing qtasks sequentially.  They exit when the message
-    passes through all qtasks.  The test ends when all ctasks complete.
-
-    num_qtasks      -- number of queue micro servers
-    num_ctasks      -- number of client tasks
-    num_runs        -- number of qmark runs
+def run_qmark(num_clients, num_servers, num_runs = 1):
+    ''' run benchmark test
     '''
 
     if num_runs < 1:
         num_runs = 1
     runs = []   # List of bench mark results
     for ix in range(num_runs):
-        qmark = QMark(num_qtasks, num_ctasks)
+        qmark = QMark(num_clients, num_servers)
         result = qmark.run()
         runs.append(result)
     return runs
@@ -134,25 +124,23 @@ def run_qmark(num_qtasks, num_ctasks, num_runs = 1):
 def qmark():
     ''' Return cpu performance indicator
     '''
-    results = run_qmark(QTASKS, CTASKS, RUNS)
+    results = run_qmark(CLIENTS, SERVERS, RUNS)
     avg = sum(results)/len(results)
     return int(1000.0/avg)
 
 
 if __name__ == '__main__':
     import math
-    num_qtasks = QTASKS
-    num_ctasks = CTASKS
-    results = run_qmark(num_qtasks, num_ctasks, RUNS)
+##    results = run_qmark(3, 2, 1)
+##    results = run_qmark(419, 79, 7)
+    results = run_qmark(CLIENTS, SERVERS, RUNS)
     num_runs = len(results)
     avg = sum(results)/num_runs
     sqr = [(x-avg)*(x-avg) for x in results]
     stdev = math.sqrt(sum(sqr)/num_runs)
     qm = int(1000.0/avg)
-    print('Simple CPU benchmark test')
-    print('   number of qtasks: {0}'.format(num_qtasks))
-    print('   number of ctasks: {0}'.format(num_ctasks))
-    print('   results [s]:      {0}'.format(' '.join(['{0:07.3f}'.format(x) for x in results])))
-    print('   average [s]:      {0:07.3f}'.format(avg))
-    print('   stdev   [s]:      {0:07.3f}'.format(stdev))
-    print('   qmark:            {0}'.format(qm))
+    print('results [s]:  {0}'.format('  '.join(['{0:5.3f}'.format(x) for x in results])))
+    print('average [s]:  {0:5.3f}'.format(avg))
+    print('stdev [s]:    {0:5.3f}'.format(stdev))
+    print('qmark:        {0}'.format(qm))
+##    print('qmark():      {0}'.format(qmark()))
